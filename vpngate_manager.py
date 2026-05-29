@@ -33,6 +33,7 @@ socket.getaddrinfo = _ipv4_getaddrinfo
 
 import vpn_utils
 import proxy_server
+import clash_bridge
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
@@ -63,6 +64,7 @@ active_openvpn_node_id = ""
 is_connecting = True
 last_active_ping_time = 0.0
 last_active_latency = 0
+clash_bridge_manager: clash_bridge.ClashBridge | None = None
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
@@ -3250,19 +3252,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def validate_path(self) -> str:
         secret_path = self.get_secret_path()
+        request_path = urllib.parse.urlsplit(self.path).path
         if not secret_path:
-            return self.path
-        if self.path == f"/{secret_path}":
+            return request_path
+        if request_path == f"/{secret_path}":
             self.send_response(HTTPStatus.FOUND)
             self.send_header("Location", f"/{secret_path}/")
             self.end_headers()
             return ""
         prefix = f"/{secret_path}/"
-        if self.path.startswith(prefix):
-            return "/" + self.path[len(prefix):]
+        if request_path.startswith(prefix):
+            return "/" + request_path[len(prefix):]
         self.send_response(HTTPStatus.NOT_FOUND)
         self.end_headers()
         return ""
+
+    def serve_clash_subscription(self) -> None:
+        global clash_bridge_manager
+        if clash_bridge_manager is None:
+            self.send_json({"error": "Clash bridge is not ready"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        parsed = urllib.parse.urlsplit(self.path)
+        token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+        if not clash_bridge_manager.check_subscription_token(token):
+            self.send_json({"error": "Forbidden"}, HTTPStatus.FORBIDDEN)
+            return
+        request_host = self.headers.get("Host", "")
+        body = clash_bridge_manager.render_subscription(request_host=request_host)
+        self.send_bytes(body.encode("utf-8"), "text/yaml; charset=utf-8")
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
@@ -3281,6 +3298,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         effective_path = self.validate_path()
         if effective_path == "": return
+
+        if effective_path == "/sub/clash.yaml":
+            self.serve_clash_subscription()
+            return
         
         if not self.is_authorized():
             if effective_path in ("/", "/index.html"):
@@ -3553,6 +3574,7 @@ class Tee:
         self.file.flush()
 
 def main() -> None:
+    global clash_bridge_manager
     ensure_dirs()
     kill_existing_openvpn_processes()
     
@@ -3578,6 +3600,14 @@ def main() -> None:
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
+    clash_bridge_manager = clash_bridge.ClashBridge(
+        data_dir=DATA_DIR,
+        config_dir=CONFIG_DIR,
+        nodes_file=NODES_FILE,
+        openvpn_command_builder=openvpn_command,
+    )
+    clash_bridge_manager.load_config()
+    threading.Thread(target=clash_bridge_manager.start, daemon=True).start()
     
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)

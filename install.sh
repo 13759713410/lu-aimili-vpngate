@@ -34,10 +34,12 @@ echo -e "${BLUE}==========================================================${PLAI
 # Default to the official repository (baoweise-bot/aimili-vpngate)
 DEFAULT_USER="baoweise-bot"
 DEFAULT_REPO="aimili-vpngate"
+DEFAULT_BRANCH="${AIMILIVPN_GITHUB_BRANCH:-}"
 
 # Allow custom repository override via command line arguments
-GITHUB_USER="${1:-${DEFAULT_USER}}"
-GITHUB_REPO="${2:-${DEFAULT_REPO}}"
+GITHUB_USER="${1:-${AIMILIVPN_GITHUB_USER:-${DEFAULT_USER}}}"
+GITHUB_REPO="${2:-${AIMILIVPN_GITHUB_REPO:-${DEFAULT_REPO}}}"
+GITHUB_BRANCH="${3:-${DEFAULT_BRANCH}}"
 
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
@@ -57,8 +59,13 @@ else
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
         git fetch --all || true
-        BRANCH="main"
-        if git rev-parse --verify origin/main >/dev/null 2>&1; then
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        BRANCH="${GITHUB_BRANCH:-main}"
+        if [ -n "${GITHUB_BRANCH}" ] && git rev-parse --verify "origin/${GITHUB_BRANCH}" >/dev/null 2>&1; then
+            BRANCH="${GITHUB_BRANCH}"
+        elif [ -n "${CURRENT_BRANCH}" ] && [ "${CURRENT_BRANCH}" != "HEAD" ] && git rev-parse --verify "origin/${CURRENT_BRANCH}" >/dev/null 2>&1; then
+            BRANCH="${CURRENT_BRANCH}"
+        elif git rev-parse --verify origin/main >/dev/null 2>&1; then
             BRANCH="main"
         elif git rev-parse --verify origin/master >/dev/null 2>&1; then
             BRANCH="master"
@@ -75,7 +82,12 @@ else
         fi
     else
         echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} ..."
-        if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
+        if [ -n "${GITHUB_BRANCH}" ]; then
+            CLONE_CMD=(git clone -b "${GITHUB_BRANCH}" "${GITHUB_URL}" "${INSTALL_DIR}")
+        else
+            CLONE_CMD=(git clone "${GITHUB_URL}" "${INSTALL_DIR}")
+        fi
+        if "${CLONE_CMD[@]}"; then
             echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
         else
             echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
@@ -162,6 +174,28 @@ def save_ui_cfg(cfg):
         return True
     except Exception:
         return False
+
+def load_clash_cfg():
+    import json
+    path = "/opt/aimilivpn/vpngate_data/clash_bridge.json"
+    cfg = {
+        "enabled": True,
+        "subscription_token": "",
+        "proxy_password": "",
+        "socks_port": 7930,
+        "http_port": 7931,
+        "max_tunnels": 8,
+        "hot_per_group": 4,
+    }
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    cfg[k] = v
+        except Exception:
+            pass
+    return cfg
 
 def load_state():
     import json
@@ -353,6 +387,14 @@ def print_status():
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
+    clash_cfg = load_clash_cfg()
+    socks_ok = check_port_listening(int(clash_cfg.get("socks_port", 7930)))
+    http_ok = check_port_listening(int(clash_cfg.get("http_port", 7931)))
+    clash_status = f"{green}[已激活]{reset}" if (socks_ok or http_ok) else f"{red}[未启动]{reset}"
+    print_line(format_line("Clash 桥接代理", clash_status))
+    if clash_cfg.get("subscription_token"):
+        sub_url = f"http://{login_ip}:{ui_port}/{secret_path}/sub/clash.yaml?token={clash_cfg.get('subscription_token')}"
+        print_line(format_line("Clash 订阅地址", f"{yellow}{sub_url}{reset}"))
     print_line()
     print_line("【活动节点状态】")
     if is_connecting:
@@ -378,6 +420,29 @@ def print_status():
     print_line(f"  export http_proxy=socks5://127.0.0.1:7928")
     print_line(f"  export https_proxy=socks5://127.0.0.1:7928")
     print_line("=======================================================")
+
+def print_clash_info():
+    cfg = load_ui_cfg()
+    clash_cfg = load_clash_cfg()
+    ui_port = cfg.get("port", 8787)
+    secret_path = cfg.get("secret_path", "EJsW2EeBo9lY")
+    login_ip = "127.0.0.1" if cfg.get("host") == "127.0.0.1" else get_public_ip()
+    token = clash_cfg.get("subscription_token", "")
+    password = clash_cfg.get("proxy_password", "")
+    print("=======================================================")
+    print("                 AimiliVPN Clash 桥接")
+    print("=======================================================")
+    if token:
+        print(f"Clash/Mihomo 订阅: http://{login_ip}:{ui_port}/{secret_path}/sub/clash.yaml?token={token}")
+    else:
+        print("Clash/Mihomo 订阅: 未生成，请重启服务或重新安装")
+    print(f"SOCKS5 代理端口: {clash_cfg.get('socks_port', 7930)}")
+    print(f"HTTP 代理端口:   {clash_cfg.get('http_port', 7931)}")
+    print("代理账号:        由订阅内每个节点自动生成")
+    print(f"代理密码:        {password or '未生成'}")
+    print(f"最大隧道数:      {clash_cfg.get('max_tunnels', 8)}")
+    print("建议:            防火墙仅放行你的 Clash VPS IP")
+    print("=======================================================")
 
 def start_service():
     print("正在启动 AimiliVPN 服务...", flush=True)
@@ -421,9 +486,12 @@ def update_service():
             # Fetch remote origin updates
             subprocess.run(["git", "fetch", "--all"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # Detect remote branch (check origin/main, then origin/master)
+            # Prefer the currently installed branch, then fall back to main/master.
+            current_branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
             branch = "main"
-            for b in ["main", "master"]:
+            for b in [current_branch, "main", "master"]:
+                if not b or b == "HEAD":
+                    continue
                 chk = subprocess.run(["git", "rev-parse", "--verify", f"origin/{b}"], capture_output=True, text=True)
                 if chk.returncode == 0:
                     branch = b
@@ -650,6 +718,7 @@ def getch_timeout(timeout=1.0):
 
 def get_status_state():
     cfg = load_ui_cfg()
+    clash_cfg = load_clash_cfg()
     state = load_state()
     return (
         cfg.get("port", 8787),
@@ -665,6 +734,8 @@ def get_status_state():
         state.get("proxy_latency_ms", 0),
         state.get("proxy_ok", False),
         check_port_listening(7928),
+        check_port_listening(int(clash_cfg.get("socks_port", 7930))),
+        check_port_listening(int(clash_cfg.get("http_port", 7931))),
         check_service_active("aimilivpn.service"),
         check_openvpn_process(),
         get_service_pid("aimilivpn.service")
@@ -714,8 +785,10 @@ def main():
             configure_port()
         elif cmd == "password":
             configure_credentials()
+        elif cmd == "clash":
+            print_clash_info()
         else:
-            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password")
+            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, clash")
         sys.exit(0)
         
     options = {
@@ -726,8 +799,9 @@ def main():
         '5': ("网页配置 (ml web)", configure_web),
         '6': ("端口配置 (ml port)", configure_port),
         '7': ("账号密码 (ml password)", configure_credentials),
-        '8': ("一键更新 (ml update)", update_service),
-        '9': ("完全卸载 (ml uninstall)", uninstall_service),
+        '8': ("Clash 订阅 (ml clash)", print_clash_info),
+        '9': ("一键更新 (ml update)", update_service),
+        'a': ("完全卸载 (ml uninstall)", uninstall_service),
         '0': ("退出终端", None)
     }
     
@@ -753,7 +827,7 @@ def main():
                     print_line(f"  {green}[{key}]{reset} {name}")
                 print_line(f"  {green}[0]{reset} {options['0'][0]}")
                 print_line("=======================================================")
-                print("请直接输入数字键 [0-9] 快速选择执行：\033[K", end="", flush=True)
+                print("请直接输入菜单键快速选择执行：\033[K", end="", flush=True)
                 print("\033[J", end="", flush=True)
                 last_state = current_state
                 
@@ -903,6 +977,37 @@ with open('$AUTH_FILE', 'w', encoding='utf-8') as f:
 "
 fi
 
+# Configure Clash/Mihomo bridge parameters.
+CLASH_FILE="${INSTALL_DIR}/vpngate_data/clash_bridge.json"
+if [ ! -f "$CLASH_FILE" ]; then
+    python3 -c "
+import json, random, string
+chars = string.ascii_letters + string.digits
+token = ''.join(random.choices(chars, k=32))
+password = ''.join(random.choices(chars, k=18))
+cfg = {
+    'enabled': True,
+    'subscription_token': token,
+    'proxy_username_prefix': 'am',
+    'proxy_password': password,
+    'public_host': '',
+    'socks_host': '0.0.0.0',
+    'socks_port': 7930,
+    'http_host': '0.0.0.0',
+    'http_port': 7931,
+    'max_tunnels': 8,
+    'hot_per_group': 4,
+    'idle_timeout_seconds': 900,
+    'prewarm_interval_seconds': 180,
+    'openvpn_timeout_seconds': 35,
+    'health_url': 'http://www.gstatic.com/generate_204'
+}
+with open('$CLASH_FILE', 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+"
+    chmod 600 "$CLASH_FILE" 2>/dev/null || true
+fi
+
 # 8. Start service
 echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
 systemctl restart aimilivpn.service || true
@@ -959,6 +1064,18 @@ echo -e "正在获取 VPS 公网 IP..."
 PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me || curl -s --max-time 3 icanhazip.com || echo "您的服务器公网IP")
 echo -n "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
 
+CLASH_FILE="${INSTALL_DIR}/vpngate_data/clash_bridge.json"
+CLASH_TOKEN="未配置"
+CLASH_PASSWORD="未配置"
+CLASH_SOCKS_PORT=7930
+CLASH_HTTP_PORT=7931
+if [ -f "$CLASH_FILE" ]; then
+    CLASH_TOKEN=$(python3 -c "import json; print(json.load(open('$CLASH_FILE')).get('subscription_token', '未配置'))" 2>/dev/null || echo "未配置")
+    CLASH_PASSWORD=$(python3 -c "import json; print(json.load(open('$CLASH_FILE')).get('proxy_password', '未配置'))" 2>/dev/null || echo "未配置")
+    CLASH_SOCKS_PORT=$(python3 -c "import json; print(json.load(open('$CLASH_FILE')).get('socks_port', 7930))" 2>/dev/null || echo "7930")
+    CLASH_HTTP_PORT=$(python3 -c "import json; print(json.load(open('$CLASH_FILE')).get('http_port', 7931))" 2>/dev/null || echo "7931")
+fi
+
 echo -e "\n${GREEN}==========================================================${PLAIN}"
 echo -e "${GREEN}             AimiliVPN 源码一键部署已完成！${PLAIN}"
 echo -e "${GREEN}==========================================================${PLAIN}"
@@ -966,8 +1083,12 @@ echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
+echo -e "  * Clash/Mihomo 订阅:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/sub/clash.yaml?token=${CLASH_TOKEN}${PLAIN}"
+echo -e "  * Clash SOCKS5 端口:  ${BLUE}${CLASH_SOCKS_PORT}${PLAIN}    HTTP 端口: ${BLUE}${CLASH_HTTP_PORT}${PLAIN}"
+echo -e "  * Clash 代理密码:  ${YELLOW}${CLASH_PASSWORD}${PLAIN}（账号由订阅内节点自动生成）"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
+echo -e "  * Clash 订阅信息: ${YELLOW}ml clash${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
 echo -e "  * 停止服务:       ${YELLOW}ml stop${PLAIN}"
 echo -e "  * 重启服务:       ${YELLOW}ml restart${PLAIN}"
