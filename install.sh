@@ -31,13 +31,15 @@ echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="baoweise-bot"
-DEFAULT_REPO="aimili-vpngate"
+# Default to the simplified Clash-enabled fork/branch.
+DEFAULT_USER="13759713410"
+DEFAULT_REPO="lu-aimili-vpngate"
+DEFAULT_BRANCH="${AIMILIVPN_GITHUB_BRANCH:-simple-clash-proxy}"
 
 # Allow custom repository override via command line arguments
 GITHUB_USER="${1:-${DEFAULT_USER}}"
 GITHUB_REPO="${2:-${DEFAULT_REPO}}"
+GITHUB_BRANCH="${3:-${DEFAULT_BRANCH}}"
 
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
@@ -57,8 +59,10 @@ else
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
         git fetch --all || true
-        BRANCH="main"
-        if git rev-parse --verify origin/main >/dev/null 2>&1; then
+        BRANCH="${GITHUB_BRANCH}"
+        if git rev-parse --verify "origin/${GITHUB_BRANCH}" >/dev/null 2>&1; then
+            BRANCH="${GITHUB_BRANCH}"
+        elif git rev-parse --verify origin/main >/dev/null 2>&1; then
             BRANCH="main"
         elif git rev-parse --verify origin/master >/dev/null 2>&1; then
             BRANCH="master"
@@ -74,8 +78,8 @@ else
             fi
         fi
     else
-        echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} ..."
-        if git clone "${GITHUB_URL}" "${INSTALL_DIR}"; then
+        echo -e "  -> 正在克隆 GitHub 仓库 ${GITHUB_URL} (${GITHUB_BRANCH}) ..."
+        if git clone -b "${GITHUB_BRANCH}" "${GITHUB_URL}" "${INSTALL_DIR}"; then
             echo -e "${GREEN}  -> 克隆成功！${PLAIN}"
         else
             echo -e "${RED}  -> 错误: 无法克隆仓库 ${GITHUB_URL}，请检查网络！${PLAIN}"
@@ -317,6 +321,7 @@ def print_status():
     is_connecting = state.get("is_connecting", False)
     
     gateway_ok = check_port_listening(7928)
+    clash_ok = check_port_listening(7930)
     service_ok = check_service_active("aimilivpn.service")
     openvpn_ok = check_openvpn_process()
     pid = get_service_pid("aimilivpn.service")
@@ -337,6 +342,7 @@ def print_status():
         openvpn_status = f"{yellow}[{state.get('active_node_latency') or '连接中'}...]{reset}"
     else:
         gateway_status = f"{green}[已激活]{reset}" if gateway_ok else f"{red}[未启动]{reset}"
+        clash_status = f"{green}[已激活]{reset}" if clash_ok else f"{red}[未启动]{reset}"
         openvpn_status = f"{green}[已连接]{reset}" if openvpn_ok else f"{red}[未连接]{reset}"
     
     print_line("=======================================================")
@@ -344,11 +350,13 @@ def print_status():
     print_line("=======================================================")
     print_line("【核心服务状态】")
     print_line(format_line("代理网关 (Port 7928)", gateway_status))
+    print_line(format_line("Clash 网关 (Port 7930)", clash_status if not is_connecting else gateway_status))
     print_line(format_line(f"管理后台 (Port {ui_port})", backend_status))
     print_line(format_line("连接核心 (OpenVPN)", openvpn_status))
     
     login_ip = "127.0.0.1" if cfg.get("host") == "127.0.0.1" else get_public_ip()
     print_line(format_line("网页登录地址", f"{yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}"))
+    print_line(format_line("Clash 订阅地址", f"{yellow}http://{login_ip}:{ui_port}/{secret_path}/sub/clash.yaml{reset}"))
     print_line(format_line("网页管理账号", cfg.get("username", "未配置")))
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
@@ -665,6 +673,7 @@ def get_status_state():
         state.get("proxy_latency_ms", 0),
         state.get("proxy_ok", False),
         check_port_listening(7928),
+        check_port_listening(7930),
         check_service_active("aimilivpn.service"),
         check_openvpn_process(),
         get_service_pid("aimilivpn.service")
@@ -966,6 +975,8 @@ echo -e "  * 网页控制面板:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
+echo -e "  * Clash/Mihomo 订阅:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/sub/clash.yaml${PLAIN}"
+echo -e "  * Clash SOCKS5 端口:  ${BLUE}7930${PLAIN}（出口跟随网页当前选中的 tun0 节点）"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"

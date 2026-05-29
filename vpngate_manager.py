@@ -45,6 +45,8 @@ OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = int(os.environ.get("LOCAL_PROXY_PORT", "7928"))
+CLASH_PROXY_HOST = os.environ.get("CLASH_PROXY_HOST", "0.0.0.0")
+CLASH_PROXY_PORT = int(os.environ.get("CLASH_PROXY_PORT", "7930"))
 UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_PORT = int(os.environ.get("UI_PORT", "8787"))
 INVALID_BACKOFF_SECONDS = int(os.environ.get("INVALID_BACKOFF_SECONDS", str(30 * 60)))
@@ -209,6 +211,8 @@ def get_state() -> dict[str, Any]:
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
     state.setdefault("check_interval_seconds", CHECK_INTERVAL_SECONDS)
     state.setdefault("local_proxy", f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}")
+    state["clash_proxy"] = f"socks5://{CLASH_PROXY_HOST}:{CLASH_PROXY_PORT}"
+    state["clash_proxy_port"] = CLASH_PROXY_PORT
     state.setdefault("last_fetch_status", "not_started")
     state.setdefault("last_check_message", "")
     state.setdefault("blacklisted_nodes", 0)
@@ -230,6 +234,10 @@ def parse_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+def yaml_scalar(value: Any) -> str:
+    text = str(value or "")
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 def fetch_api_text() -> str:
     request = urllib.request.Request(
@@ -2105,6 +2113,10 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       立即检测补齐
     </button>
+    <button id="copy_clash_sub" class="btn-primary" style="background: rgba(34, 211, 238, 0.18); border: 1px solid rgba(34, 211, 238, 0.35);">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 16h8M8 12h8m-6 8h4a2 2 0 002-2V7.414a2 2 0 00-.586-1.414l-2.414-2.414A2 2 0 0011.586 3H8a2 2 0 00-2 2v13a2 2 0 002 2z" /></svg>
+      Clash订阅
+    </button>
     <div class="dropdown">
       <button id="admin_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
@@ -2563,7 +2575,7 @@ function render(){
   
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  $("status").innerHTML=`<span class="status-dot"></span>本地代理：http://127.0.0.1:7928 | Clash端口：${esc(state.clash_proxy_port || 7930)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -2888,6 +2900,15 @@ $("check").onclick=async()=>{
   try{await fetch("./api/check",{method:"POST"}); await load();} 
   finally{$("check").disabled=false; $("check").textContent="立即检测补齐";}
 };
+$("copy_clash_sub").onclick=async()=>{
+  const url = new URL("sub/clash.yaml", location.href).href;
+  try {
+    await navigator.clipboard.writeText(url);
+    alert("已复制 Clash 订阅地址");
+  } catch(e) {
+    window.prompt("Clash 订阅地址", url);
+  }
+};
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
   const badge = $("proxy_status_badge");
@@ -3123,6 +3144,50 @@ def check_proxy_health() -> dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
 
+def clash_subscription_host(request_host: str = "") -> str:
+    if request_host:
+        return request_host.split(":", 1)[0]
+    public_ip_file = DATA_DIR / "public_ip.txt"
+    try:
+        public_ip = public_ip_file.read_text(encoding="utf-8").strip()
+        if public_ip:
+            return public_ip
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+def render_clash_subscription(request_host: str = "") -> str:
+    host = clash_subscription_host(request_host)
+    nodes = read_json(NODES_FILE, [])
+    active_node = next((n for n in nodes if active_openvpn_node_id and n.get("id") == active_openvpn_node_id), None)
+    if active_node:
+        country = active_node.get("country_short") or active_node.get("country") or "VPNGate"
+        ip = active_node.get("ip") or active_node.get("remote_host") or active_openvpn_node_id
+        proxy_name = f"VPNGate tun0 {country} {ip}"
+    else:
+        proxy_name = "VPNGate tun0 当前节点"
+    group_name = "VPNGate-tun0"
+    lines = [
+        "mixed-port: 7890",
+        "allow-lan: false",
+        "mode: rule",
+        "log-level: info",
+        "proxies:",
+        f"  - name: {yaml_scalar(proxy_name)}",
+        "    type: socks5",
+        f"    server: {yaml_scalar(host)}",
+        f"    port: {CLASH_PROXY_PORT}",
+        "proxy-groups:",
+        f"  - name: {yaml_scalar(group_name)}",
+        "    type: select",
+        "    proxies:",
+        f"      - {yaml_scalar(proxy_name)}",
+        "      - DIRECT",
+        "rules:",
+        f"  - MATCH,{group_name}",
+    ]
+    return "\n".join(lines) + "\n"
+
 def background_proxy_checker() -> None:
     time.sleep(2)
     while True:
@@ -3250,19 +3315,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def validate_path(self) -> str:
         secret_path = self.get_secret_path()
+        request_path = urllib.parse.urlsplit(self.path).path
         if not secret_path:
-            return self.path
-        if self.path == f"/{secret_path}":
+            return request_path
+        if request_path == f"/{secret_path}":
             self.send_response(HTTPStatus.FOUND)
             self.send_header("Location", f"/{secret_path}/")
             self.end_headers()
             return ""
         prefix = f"/{secret_path}/"
-        if self.path.startswith(prefix):
-            return "/" + self.path[len(prefix):]
+        if request_path.startswith(prefix):
+            return "/" + request_path[len(prefix):]
         self.send_response(HTTPStatus.NOT_FOUND)
         self.end_headers()
         return ""
+
+    def serve_clash_subscription(self) -> None:
+        body = render_clash_subscription(request_host=self.headers.get("Host", ""))
+        self.send_bytes(body.encode("utf-8"), "text/yaml; charset=utf-8")
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
@@ -3281,7 +3351,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         effective_path = self.validate_path()
         if effective_path == "": return
-        
+
+        if effective_path == "/sub/clash.yaml":
+            self.serve_clash_subscription()
+            return
+
         if not self.is_authorized():
             if effective_path in ("/", "/index.html"):
                 self.send_bytes(LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
@@ -3569,6 +3643,8 @@ def main() -> None:
             "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
             "check_interval_seconds": CHECK_INTERVAL_SECONDS,
             "local_proxy": f"http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
+            "clash_proxy": f"socks5://{CLASH_PROXY_HOST}:{CLASH_PROXY_PORT}",
+            "clash_proxy_port": CLASH_PROXY_PORT,
             "active_openvpn_node_id": "",
             "last_fetch_status": "starting",
             "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
@@ -3578,6 +3654,8 @@ def main() -> None:
         },
     )
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
+    if (CLASH_PROXY_HOST, CLASH_PROXY_PORT) != (LOCAL_PROXY_HOST, LOCAL_PROXY_PORT):
+        threading.Thread(target=proxy_server.start_proxy_server, args=(CLASH_PROXY_HOST, CLASH_PROXY_PORT), daemon=True).start()
     
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)
@@ -3612,6 +3690,7 @@ def main() -> None:
     
     print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
+    print(f"Clash proxy: socks5://{CLASH_PROXY_HOST}:{CLASH_PROXY_PORT}", flush=True)
     ThreadingHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":
