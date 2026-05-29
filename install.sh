@@ -183,9 +183,14 @@ def load_clash_cfg():
         "subscription_token": "",
         "proxy_password": "",
         "socks_port": 7930,
-        "http_port": 7931,
+        "http_enabled": False,
+        "http_port": 0,
         "max_tunnels": 8,
         "hot_per_group": 4,
+        "residential_slots": 4,
+        "refresh_verify_limit": 40,
+        "subscription_requires_bridge_verified": True,
+        "verified_ttl_seconds": 1800,
     }
     if os.path.exists(path):
         try:
@@ -388,10 +393,10 @@ def print_status():
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
     clash_cfg = load_clash_cfg()
-    socks_ok = check_port_listening(int(clash_cfg.get("socks_port", 7930)))
-    http_ok = check_port_listening(int(clash_cfg.get("http_port", 7931)))
-    clash_status = f"{green}[已激活]{reset}" if (socks_ok or http_ok) else f"{red}[未启动]{reset}"
-    print_line(format_line("Clash 桥接代理", clash_status))
+    socks_port = int(clash_cfg.get("socks_port", 7930) or 7930)
+    socks_ok = socks_port > 0 and check_port_listening(socks_port)
+    clash_status = f"{green}[已激活]{reset}" if socks_ok else f"{red}[未启动]{reset}"
+    print_line(format_line("Clash 住宅 SOCKS5", clash_status))
     if clash_cfg.get("subscription_token"):
         sub_url = f"http://{login_ip}:{ui_port}/{secret_path}/sub/clash.yaml?token={clash_cfg.get('subscription_token')}"
         print_line(format_line("Clash 订阅地址", f"{yellow}{sub_url}{reset}"))
@@ -436,8 +441,7 @@ def print_clash_info():
         print(f"Clash/Mihomo 订阅: http://{login_ip}:{ui_port}/{secret_path}/sub/clash.yaml?token={token}")
     else:
         print("Clash/Mihomo 订阅: 未生成，请重启服务或重新安装")
-    print(f"SOCKS5 代理端口: {clash_cfg.get('socks_port', 7930)}")
-    print(f"HTTP 代理端口:   {clash_cfg.get('http_port', 7931)}")
+    print(f"住宅 SOCKS5 端口: {clash_cfg.get('socks_port', 7930)}")
     print("代理账号:        由订阅内每个节点自动生成")
     print(f"代理密码:        {password or '未生成'}")
     print(f"最大隧道数:      {clash_cfg.get('max_tunnels', 8)}")
@@ -720,6 +724,7 @@ def get_status_state():
     cfg = load_ui_cfg()
     clash_cfg = load_clash_cfg()
     state = load_state()
+    clash_socks_port = int(clash_cfg.get("socks_port", 7930) or 7930)
     return (
         cfg.get("port", 8787),
         cfg.get("secret_path", "EJsW2EeBo9lY"),
@@ -734,8 +739,7 @@ def get_status_state():
         state.get("proxy_latency_ms", 0),
         state.get("proxy_ok", False),
         check_port_listening(7928),
-        check_port_listening(int(clash_cfg.get("socks_port", 7930))),
-        check_port_listening(int(clash_cfg.get("http_port", 7931))),
+        clash_socks_port > 0 and check_port_listening(clash_socks_port),
         check_service_active("aimilivpn.service"),
         check_openvpn_process(),
         get_service_pid("aimilivpn.service")
@@ -994,13 +998,18 @@ cfg = {
     'socks_host': '0.0.0.0',
     'socks_port': 7930,
     'http_host': '0.0.0.0',
-    'http_port': 7931,
+    'http_port': 0,
+    'http_enabled': False,
     'max_tunnels': 8,
     'hot_per_group': 4,
+    'residential_slots': 4,
     'idle_timeout_seconds': 900,
     'prewarm_interval_seconds': 180,
     'openvpn_timeout_seconds': 35,
-    'health_url': 'http://www.gstatic.com/generate_204'
+    'health_url': 'http://www.gstatic.com/generate_204',
+    'refresh_verify_limit': 40,
+    'subscription_requires_bridge_verified': True,
+    'verified_ttl_seconds': 1800
 }
 with open('$CLASH_FILE', 'w', encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -1068,12 +1077,10 @@ CLASH_FILE="${INSTALL_DIR}/vpngate_data/clash_bridge.json"
 CLASH_TOKEN="未配置"
 CLASH_PASSWORD="未配置"
 CLASH_SOCKS_PORT=7930
-CLASH_HTTP_PORT=7931
 if [ -f "$CLASH_FILE" ]; then
     CLASH_TOKEN=$(python3 -c "import json; print(json.load(open('$CLASH_FILE')).get('subscription_token', '未配置'))" 2>/dev/null || echo "未配置")
     CLASH_PASSWORD=$(python3 -c "import json; print(json.load(open('$CLASH_FILE')).get('proxy_password', '未配置'))" 2>/dev/null || echo "未配置")
     CLASH_SOCKS_PORT=$(python3 -c "import json; print(json.load(open('$CLASH_FILE')).get('socks_port', 7930))" 2>/dev/null || echo "7930")
-    CLASH_HTTP_PORT=$(python3 -c "import json; print(json.load(open('$CLASH_FILE')).get('http_port', 7931))" 2>/dev/null || echo "7931")
 fi
 
 echo -e "\n${GREEN}==========================================================${PLAIN}"
@@ -1084,7 +1091,7 @@ echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
 echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}"
 echo -e "  * Clash/Mihomo 订阅:  ${BLUE}http://${PUBLIC_IP}:${UI_PORT}/${SECRET_PATH}/sub/clash.yaml?token=${CLASH_TOKEN}${PLAIN}"
-echo -e "  * Clash SOCKS5 端口:  ${BLUE}${CLASH_SOCKS_PORT}${PLAIN}    HTTP 端口: ${BLUE}${CLASH_HTTP_PORT}${PLAIN}"
+echo -e "  * Clash 住宅 SOCKS5 端口:  ${BLUE}${CLASH_SOCKS_PORT}${PLAIN}"
 echo -e "  * Clash 代理密码:  ${YELLOW}${CLASH_PASSWORD}${PLAIN}（账号由订阅内节点自动生成）"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"

@@ -2111,7 +2111,7 @@ INDEX_HTML = r"""<!doctype html>
     </button>
     <button id="clash_refresh" class="btn-primary" style="background: rgba(34, 211, 238, 0.18); border: 1px solid rgba(34, 211, 238, 0.35);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" /></svg>
-      刷新 Clash 节点
+      刷新住宅IP
     </button>
     <div class="dropdown">
       <button id="admin_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
@@ -2572,7 +2572,8 @@ function render(){
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const clashBridge = state.clash_bridge || {};
-  const clashStatusText = clashBridge.running ? ` | Clash：${esc(clashBridge.message || '正在验证')}` : "";
+  const clashMessage = clashBridge.message || "";
+  const clashStatusText = clashMessage && clashMessage !== "idle" ? ` | 住宅IP：${esc(clashMessage)}` : "";
   $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}${clashStatusText}`;
   
   // Update proxy test status card based on background checks
@@ -2901,20 +2902,20 @@ $("check").onclick=async()=>{
 $("clash_refresh").onclick=async()=>{
   const btn = $("clash_refresh");
   btn.disabled = true;
-  btn.textContent = "正在验证...";
+  btn.textContent = "正在验证住宅IP...";
   try{
     const resp = await fetch("./api/clash_refresh",{method:"POST"});
     const result = await resp.json();
     if (!result.ok) {
-      alert("刷新 Clash 节点失败: " + (result.error || "未知错误"));
+      alert("刷新住宅IP失败: " + (result.error || "未知错误"));
     }
     await load();
   } catch(e) {
-    alert("刷新 Clash 节点请求失败");
+    alert("刷新住宅IP请求失败");
   } finally {
     setTimeout(()=>{
       btn.disabled = false;
-      btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" /></svg>刷新 Clash 节点`;
+      btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" /></svg>刷新住宅IP`;
     }, 3000);
   }
 };

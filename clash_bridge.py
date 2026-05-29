@@ -27,16 +27,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "socks_host": "0.0.0.0",
     "socks_port": 7930,
     "http_host": "0.0.0.0",
-    "http_port": 7931,
+    "http_port": 0,
+    "http_enabled": False,
     "max_tunnels": 8,
     "hot_per_group": 4,
+    "residential_slots": 4,
     "idle_timeout_seconds": 900,
-        "prewarm_interval_seconds": 180,
-        "openvpn_timeout_seconds": 35,
-        "health_url": "http://www.gstatic.com/generate_204",
-        "refresh_verify_limit": 20,
-        "subscription_requires_bridge_verified": True,
-        "verified_ttl_seconds": 1800,
+    "prewarm_interval_seconds": 180,
+    "openvpn_timeout_seconds": 35,
+    "health_url": "http://www.gstatic.com/generate_204",
+    "refresh_verify_limit": 40,
+    "subscription_requires_bridge_verified": True,
+    "verified_ttl_seconds": 1800,
 }
 
 
@@ -291,7 +293,7 @@ class ClashBridge:
         return "127.0.0.1"
 
     def available_nodes(self) -> list[dict[str, Any]]:
-        nodes = self._raw_available_nodes()
+        nodes = self._raw_residential_nodes()
         cfg = self.load_config()
         if not bool(cfg.get("subscription_requires_bridge_verified", True)):
             return nodes
@@ -315,6 +317,9 @@ class ClashBridge:
                 result.append(node)
         return sorted(result, key=lambda n: (_node_latency(n), -_parse_int(n.get("score"))))
 
+    def _raw_residential_nodes(self) -> list[dict[str, Any]]:
+        return [node for node in self._raw_available_nodes() if _is_residential(node)]
+
     def node_by_username(self, username: str) -> dict[str, Any] | None:
         prefix = str(self.load_config().get("proxy_username_prefix") or "am")
         for node in self.available_nodes():
@@ -331,18 +336,13 @@ class ClashBridge:
         cfg = self.load_config()
         host = self.public_host(request_host)
         socks_port = _parse_int(cfg.get("socks_port"), 7930)
-        http_port = _parse_int(cfg.get("http_port"), 7931)
         password = str(cfg.get("proxy_password") or "")
         prefix = str(cfg.get("proxy_username_prefix") or "am")
         health_url = str(cfg.get("health_url") or DEFAULT_CONFIG["health_url"])
-        hot_per_group = max(1, _parse_int(cfg.get("hot_per_group"), 4))
+        residential_slots = max(1, _parse_int(cfg.get("residential_slots"), 4))
 
-        residential = [n for n in self.available_nodes() if _is_residential(n)]
-        non_residential = [n for n in self.available_nodes() if not _is_residential(n)]
+        residential = self.available_nodes()[:residential_slots]
         res_names = self._proxy_names_for_nodes(residential)
-        non_res_names = self._proxy_names_for_nodes(non_residential)
-        res_hot = res_names[:hot_per_group]
-        non_res_hot = non_res_names[:hot_per_group]
 
         lines = [
             "mixed-port: 7890",
@@ -358,58 +358,30 @@ class ClashBridge:
             "proxies:",
         ]
 
-        all_nodes = residential + non_residential
-        if not all_nodes:
+        if not residential:
             lines[-1] = "proxies: []"
         else:
             used_names: set[str] = set()
-            for node in all_nodes:
-                for proto, port, suffix in (("socks5", socks_port, "S"), ("http", http_port, "H")):
-                    name = self._proxy_name(node, suffix)
-                    if name in used_names:
-                        continue
-                    used_names.add(name)
-                    username = node_username(str(node.get("id") or ""), prefix)
-                    lines.extend(
-                        [
-                            f"  - name: {_yaml_scalar(name)}",
-                            f"    type: {proto}",
-                            f"    server: {_yaml_scalar(host)}",
-                            f"    port: {port}",
-                            f"    username: {_yaml_scalar(username)}",
-                            f"    password: {_yaml_scalar(password)}",
-                        ]
-                    )
+            for node in residential:
+                name = self._proxy_name(node, "S")
+                if name in used_names:
+                    continue
+                used_names.add(name)
+                username = node_username(str(node.get("id") or ""), prefix)
+                lines.extend(
+                    [
+                        f"  - name: {_yaml_scalar(name)}",
+                        "    type: socks5",
+                        f"    server: {_yaml_scalar(host)}",
+                        f"    port: {socks_port}",
+                        f"    username: {_yaml_scalar(username)}",
+                        f"    password: {_yaml_scalar(password)}",
+                    ]
+                )
 
-        main_group_choices: list[str] = []
-        if res_names:
-            main_group_choices.extend(["住宅IP-优选", "住宅IP-手动"])
-        if non_res_names:
-            main_group_choices.extend(["非住宅IP-优选", "非住宅IP-手动"])
-        if not main_group_choices:
-            main_group_choices = ["REJECT"]
-        elif "REJECT" not in main_group_choices:
-            main_group_choices.append("REJECT")
+        self._append_group(lines, "住宅IP-优选", "url-test", res_names, health_url)
 
-        lines.extend(
-            [
-                "proxy-groups:",
-                f"  - name: {_yaml_scalar('VPNGate出口')}",
-                "    type: select",
-                "    proxies:",
-            ]
-        )
-        for item in main_group_choices:
-            lines.append(f"      - {_yaml_scalar(item)}")
-
-        self._append_group(lines, "住宅IP-优选", "url-test", res_hot, health_url)
-        self._append_group(lines, "非住宅IP-优选", "url-test", non_res_hot, health_url)
-        self._append_group(lines, "住宅IP-手动", "select", res_names, health_url)
-        self._append_group(lines, "非住宅IP-手动", "select", non_res_names, health_url)
-
-        lines.extend(["rules:", "  - MATCH,VPNGate出口"])
-        if all_nodes:
-            threading.Thread(target=self._prewarm_hot_nodes, daemon=True).start()
+        lines.extend(["rules:", "  - MATCH,住宅IP-优选"])
         return "\n".join(lines) + "\n"
 
     def refresh_status_snapshot(self) -> dict[str, Any]:
@@ -424,28 +396,32 @@ class ClashBridge:
             if self.refresh_running:
                 return {"ok": True, "started": False, "message": self.refresh_status}
             self.refresh_running = True
-            self.refresh_status = "正在后台验证 Clash 订阅节点..."
+            self.refresh_status = "正在后台验证住宅 IP 节点..."
         threading.Thread(target=self._refresh_worker, daemon=True).start()
         return {"ok": True, "started": True, "message": self.refresh_status}
 
     def _refresh_worker(self) -> None:
         checked = 0
         failed = 0
+        passed = 0
         try:
             cfg = self.load_config()
             limit = max(1, _parse_int(cfg.get("refresh_verify_limit"), 20))
-            nodes = self._raw_available_nodes()[:limit]
+            target = max(1, _parse_int(cfg.get("residential_slots"), 4))
+            nodes = self._raw_residential_nodes()[:limit]
             if not nodes:
                 with self.refresh_lock:
-                    self.refresh_status = "没有可验证的 Clash 可用节点"
+                    self.refresh_status = "没有可验证的住宅 IP 候选节点"
                 return
             for node in nodes:
+                if passed >= target:
+                    break
                 node_id = str(node.get("id") or "")
                 if not node_id:
                     continue
                 checked += 1
                 with self.refresh_lock:
-                    self.refresh_status = f"正在验证 Clash 节点 {checked}/{len(nodes)}: {node_id}"
+                    self.refresh_status = f"正在验证住宅 IP {checked}/{len(nodes)}，已通过 {passed}/{target}: {node_id}"
                 try:
                     interface = self.ensure_tunnel(node_id)
                     ok, message = self._check_tunnel_health(interface)
@@ -453,14 +429,15 @@ class ClashBridge:
                         self._mark_unavailable(node_id, message)
                         raise RuntimeError(message)
                     self._mark_clash_available(node_id, "Clash bridge health check ok")
+                    passed += 1
                 except Exception as exc:
                     failed += 1
                     print(f"[ClashBridge] refresh verification failed for {node_id}: {exc}", flush=True)
             with self.refresh_lock:
-                self.refresh_status = f"Clash 节点验证完成：已检查 {checked} 个，通过 {checked - failed} 个，剔除/失败 {failed} 个；请在 Clash 客户端更新订阅"
+                self.refresh_status = f"住宅 IP 验证完成：已检查 {checked} 个，通过 {passed} 个，失败 {failed} 个；请在 Clash 客户端更新订阅"
         except Exception as exc:
             with self.refresh_lock:
-                self.refresh_status = f"Clash 节点验证异常: {exc}"
+                self.refresh_status = f"住宅 IP 验证异常: {exc}"
         finally:
             with self.refresh_lock:
                 self.refresh_running = False
@@ -469,7 +446,6 @@ class ClashBridge:
         names: list[str] = []
         for node in nodes:
             names.append(self._proxy_name(node, "S"))
-            names.append(self._proxy_name(node, "H"))
         return names
 
     def _proxy_name(self, node: dict[str, Any], suffix: str) -> str:
@@ -502,16 +478,20 @@ class ClashBridge:
         self.running = True
         cfg = self.load_config()
         threading.Thread(target=self._maintenance_loop, daemon=True).start()
-        threading.Thread(
-            target=self._start_socks_server,
-            args=(str(cfg.get("socks_host") or "0.0.0.0"), _parse_int(cfg.get("socks_port"), 7930)),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=self._start_http_server,
-            args=(str(cfg.get("http_host") or "0.0.0.0"), _parse_int(cfg.get("http_port"), 7931)),
-            daemon=True,
-        ).start()
+        socks_port = _parse_int(cfg.get("socks_port"), 7930)
+        if socks_port > 0:
+            threading.Thread(
+                target=self._start_socks_server,
+                args=(str(cfg.get("socks_host") or "0.0.0.0"), socks_port),
+                daemon=True,
+            ).start()
+        http_port = _parse_int(cfg.get("http_port"), 0)
+        if bool(cfg.get("http_enabled", False)) and http_port > 0:
+            threading.Thread(
+                target=self._start_http_server,
+                args=(str(cfg.get("http_host") or "0.0.0.0"), http_port),
+                daemon=True,
+            ).start()
 
     def ensure_tunnel(self, node_id: str) -> str:
         with self.lock:
@@ -760,6 +740,8 @@ class ClashBridge:
             try:
                 with self.lock:
                     self._cleanup_idle_locked()
+                if len(self.available_nodes()) < max(1, _parse_int(self.load_config().get("residential_slots"), 4)):
+                    self.trigger_refresh()
                 self._prewarm_hot_nodes()
             except Exception as exc:
                 print(f"[ClashBridge] maintenance error: {exc}", flush=True)
@@ -767,13 +749,10 @@ class ClashBridge:
 
     def _prewarm_hot_nodes(self) -> None:
         cfg = self.load_config()
-        hot_per_group = max(0, _parse_int(cfg.get("hot_per_group"), 4))
-        if hot_per_group <= 0:
+        slots = max(0, _parse_int(cfg.get("residential_slots"), 4))
+        if slots <= 0:
             return
-        nodes = self.available_nodes()
-        residential = [n for n in nodes if _is_residential(n)][:hot_per_group]
-        non_residential = [n for n in nodes if not _is_residential(n)][:hot_per_group]
-        for node in residential + non_residential:
+        for node in self.available_nodes()[:slots]:
             node_id = str(node.get("id") or "")
             if not node_id:
                 continue
