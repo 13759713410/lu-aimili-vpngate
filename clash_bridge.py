@@ -379,7 +379,9 @@ class ClashBridge:
                     ]
                 )
 
-        self._append_group(lines, "住宅IP-优选", "url-test", res_names, health_url)
+        lines.append("proxy-groups:")
+        group_type = "url-test" if res_names else "select"
+        self._append_group(lines, "住宅IP-优选", group_type, res_names, health_url)
 
         lines.extend(["rules:", "  - MATCH,住宅IP-优选"])
         return "\n".join(lines) + "\n"
@@ -391,6 +393,124 @@ class ClashBridge:
                 "message": self.refresh_status,
             }
 
+    def residential_status_snapshot(self, request_host: str = "") -> dict[str, Any]:
+        cfg = self.load_config()
+        target = max(1, _parse_int(cfg.get("residential_slots"), 4))
+        candidates = self._raw_residential_nodes()
+        verified = self.available_nodes()
+        verified_ids = {str(node.get("id") or "") for node in verified}
+        network = self._managed_network_snapshot()
+        now = time.time()
+
+        with self.lock:
+            active_tunnels = {
+                node_id: state
+                for node_id, state in self.tunnels.items()
+                if state.process.poll() is None
+            }
+
+        rows: list[dict[str, Any]] = []
+        for node in candidates:
+            node_id = str(node.get("id") or "")
+            if not node_id:
+                continue
+            tunnel = active_tunnels.get(node_id)
+            interface = tunnel.interface if tunnel else str(node.get("clash_interface") or "")
+            table = tunnel.table if tunnel else _parse_int(node.get("clash_table"))
+            rule = network["rules"].get(interface, {}) if interface else {}
+            route = network["routes"].get(str(table), "") if table else ""
+            interface_exists = bool(interface and interface in network["interfaces"])
+            route_exists = bool(interface and route and f"dev {interface}" in route)
+            rule_exists = bool(rule.get("exists"))
+            rule_detached = bool(rule.get("detached"))
+            probed_at = float(node.get("clash_probed_at") or 0)
+            rows.append(
+                {
+                    "id": node_id,
+                    "country": node.get("country") or "",
+                    "country_short": node.get("country_short") or "",
+                    "ip": node.get("ip") or node.get("remote_host") or "",
+                    "remote_port": node.get("remote_port") or "",
+                    "latency_ms": _parse_int(node.get("latency_ms")),
+                    "score": _parse_int(node.get("score")),
+                    "ip_type": node.get("ip_type") or "",
+                    "quality": node.get("quality") or "",
+                    "probe_status": node.get("probe_status") or "",
+                    "clash_probe_status": node.get("clash_probe_status") or "",
+                    "clash_probe_message": node.get("clash_probe_message") or "",
+                    "clash_probed_at": probed_at,
+                    "clash_probe_age_seconds": int(now - probed_at) if probed_at else 0,
+                    "subscribable": node_id in verified_ids,
+                    "tunnel_running": bool(tunnel),
+                    "interface": interface,
+                    "table": table,
+                    "interface_exists": interface_exists,
+                    "route_exists": route_exists,
+                    "rule_exists": rule_exists,
+                    "rule_detached": rule_detached,
+                    "route": route,
+                    "rule": rule.get("raw", ""),
+                }
+            )
+
+        active_tunnel_rows = []
+        for node_id, tunnel in active_tunnels.items():
+            interface_info = network["interfaces"].get(tunnel.interface, {})
+            rule = network["rules"].get(tunnel.interface, {})
+            route = network["routes"].get(str(tunnel.table), "")
+            active_tunnel_rows.append(
+                {
+                    "node_id": node_id,
+                    "interface": tunnel.interface,
+                    "table": tunnel.table,
+                    "interface_exists": tunnel.interface in network["interfaces"],
+                    "interface_state": interface_info.get("state", ""),
+                    "route_exists": bool(route and f"dev {tunnel.interface}" in route),
+                    "rule_exists": bool(rule.get("exists")),
+                    "rule_detached": bool(rule.get("detached")),
+                    "started_at": tunnel.started_at,
+                    "last_used": tunnel.last_used,
+                }
+            )
+
+        rows.sort(
+            key=lambda item: (
+                0 if item["subscribable"] else 1,
+                0 if item["tunnel_running"] else 1,
+                item["latency_ms"] if item["latency_ms"] > 0 else 999999,
+                -item["score"],
+            )
+        )
+
+        with self.refresh_lock:
+            running = self.refresh_running
+            message = self.refresh_status
+
+        detached_count = sum(1 for rule in network["rules"].values() if rule.get("detached"))
+        return {
+            "ok": True,
+            "running": running,
+            "message": message,
+            "counts": {
+                "target": target,
+                "residential_candidates": len(candidates),
+                "verified": len(verified),
+                "subscription": min(len(verified), target),
+                "active_tunnels": len(active_tunnels),
+                "managed_interfaces": len(network["interfaces"]),
+                "detached_rules": detached_count,
+            },
+            "subscription": {
+                "ready": bool(verified),
+                "node_count": min(len(verified), target),
+                "host": self.public_host(request_host),
+                "socks_port": _parse_int(cfg.get("socks_port"), 7930),
+                "token": str(cfg.get("subscription_token") or ""),
+            },
+            "tunnels": active_tunnel_rows,
+            "nodes": rows,
+        }
+
     def trigger_refresh(self) -> dict[str, Any]:
         with self.refresh_lock:
             if self.refresh_running:
@@ -400,11 +520,24 @@ class ClashBridge:
         threading.Thread(target=self._refresh_worker, daemon=True).start()
         return {"ok": True, "started": True, "message": self.refresh_status}
 
+    def trigger_repair(self) -> dict[str, Any]:
+        with self.refresh_lock:
+            if self.refresh_running:
+                return {"ok": True, "started": False, "message": self.refresh_status}
+            self.refresh_running = True
+            self.refresh_status = "正在诊断补齐住宅 IP 热池..."
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
+        return {"ok": True, "started": True, "message": self.refresh_status}
+
     def _refresh_worker(self) -> None:
         checked = 0
         failed = 0
         passed = 0
         try:
+            with self.lock:
+                self._cleanup_idle_locked()
+                self._cleanup_managed_policy_routing(preserve_active=True)
+                self._reconcile_active_policy_routing_locked()
             cfg = self.load_config()
             limit = max(1, _parse_int(cfg.get("refresh_verify_limit"), 20))
             target = max(1, _parse_int(cfg.get("residential_slots"), 4))
@@ -428,7 +561,7 @@ class ClashBridge:
                     if not ok:
                         self._mark_unavailable(node_id, message)
                         raise RuntimeError(message)
-                    self._mark_clash_available(node_id, "Clash bridge health check ok")
+                    self._mark_clash_available(node_id, "Clash bridge health check ok", interface)
                     passed += 1
                 except Exception as exc:
                     failed += 1
@@ -477,6 +610,7 @@ class ClashBridge:
             return
         self.running = True
         cfg = self.load_config()
+        self._cleanup_managed_policy_routing()
         threading.Thread(target=self._maintenance_loop, daemon=True).start()
         socks_port = _parse_int(cfg.get("socks_port"), 7930)
         if socks_port > 0:
@@ -672,6 +806,79 @@ class ClashBridge:
         subprocess.run(["ip", "rule", "del", "oif", interface, "table", str(table)], capture_output=True, timeout=2)
         subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
 
+    def _managed_interface_tables(self) -> list[tuple[str, int]]:
+        max_tunnels = max(1, _parse_int(self.load_config().get("max_tunnels"), 8))
+        return [(f"tun{idx}", 110 + idx) for idx in range(10, 10 + max_tunnels * 4)]
+
+    def _cleanup_managed_policy_routing(self, preserve_active: bool = False) -> None:
+        if not os.name == "posix":
+            return
+        active_interfaces: set[str] = set()
+        if preserve_active:
+            active_interfaces = {
+                state.interface
+                for state in self.tunnels.values()
+                if state.process.poll() is None
+            }
+        for interface, table in self._managed_interface_tables():
+            if interface in active_interfaces:
+                continue
+            subprocess.run(["ip", "rule", "del", "oif", interface, "table", str(table)], capture_output=True, timeout=2)
+            subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
+
+    def _reconcile_active_policy_routing_locked(self) -> None:
+        for state in list(self.tunnels.values()):
+            if state.process.poll() is None:
+                try:
+                    self._setup_policy_routing(state.interface, state.table)
+                except Exception as exc:
+                    print(f"[ClashBridge] failed to reconcile policy routing for {state.interface}: {exc}", flush=True)
+
+    def _ip_output(self, args: list[str], timeout: float = 1.5) -> str:
+        if not os.name == "posix":
+            return ""
+        try:
+            proc = subprocess.run(["ip", *args], capture_output=True, text=True, timeout=timeout)
+            return proc.stdout or ""
+        except Exception:
+            return ""
+
+    def _managed_network_snapshot(self) -> dict[str, Any]:
+        interfaces: dict[str, dict[str, Any]] = {}
+        managed = self._managed_interface_tables()
+        managed_names = {interface for interface, _ in managed}
+        for line in self._ip_output(["-br", "addr", "show"]).splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[0].split("@", 1)[0]
+            if name in managed_names:
+                interfaces[name] = {
+                    "name": name,
+                    "state": parts[1],
+                    "addresses": parts[2:],
+                    "raw": line,
+                }
+
+        rules: dict[str, dict[str, Any]] = {}
+        rule_lines = self._ip_output(["rule", "show"]).splitlines()
+        for interface, table in managed:
+            raw = next((line for line in rule_lines if f"oif {interface}" in line), "")
+            if raw:
+                lookup_text = f"lookup {table}"
+                rules[interface] = {
+                    "exists": lookup_text in raw or f"table {table}" in raw,
+                    "detached": "[detached]" in raw,
+                    "table": table,
+                    "raw": raw,
+                }
+
+        routes: dict[str, str] = {}
+        route_tables = {str(table) for _, table in managed}
+        for table in route_tables:
+            routes[table] = self._ip_output(["route", "show", "table", table]).strip()
+        return {"interfaces": interfaces, "rules": rules, "routes": routes}
+
     def _stop_process(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is not None:
             return
@@ -721,7 +928,7 @@ class ClashBridge:
         if changed:
             _write_json(self.nodes_file, nodes)
 
-    def _mark_clash_available(self, node_id: str, message: str) -> None:
+    def _mark_clash_available(self, node_id: str, message: str, interface: str = "") -> None:
         nodes = _read_json(self.nodes_file, [])
         if not isinstance(nodes, list):
             return
@@ -731,6 +938,9 @@ class ClashBridge:
                 node["clash_probe_status"] = "available"
                 node["clash_probe_message"] = message
                 node["clash_probed_at"] = time.time()
+                if interface:
+                    node["clash_interface"] = interface
+                    node["clash_table"] = 110 + _parse_int(interface.removeprefix("tun"), 0)
                 changed = True
         if changed:
             _write_json(self.nodes_file, nodes)

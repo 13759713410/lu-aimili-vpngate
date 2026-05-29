@@ -422,14 +422,16 @@ def stop_process(process: subprocess.Popen[str] | None) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
 
-def kill_existing_openvpn_processes() -> None:
+def kill_existing_openvpn_processes(include_clash_bridge: bool = False) -> None:
     if not sys.platform.startswith("linux"):
         return
     try:
-        # Terminate existing openvpn processes managing tun0 or using our vpngate configuration
-        subprocess.run(["pkill", "-f", "openvpn.*tun0"], capture_output=True, timeout=2)
-        subprocess.run(["pkill", "-f", "openvpn.*vpngate_data"], capture_output=True, timeout=2)
-        print("[Cleanup] Terminated existing AimiliVPN OpenVPN processes.", flush=True)
+        # Only tun0 belongs to the original local proxy flow. Clash bridge tunnels use tun10+.
+        subprocess.run(["pkill", "-f", "openvpn.*--dev tun0"], capture_output=True, timeout=2)
+        if include_clash_bridge:
+            subprocess.run(["pkill", "-f", r"openvpn.*clash_.*\.ovpn"], capture_output=True, timeout=2)
+        scope = "tun0 and old Clash bridge" if include_clash_bridge else "tun0"
+        print(f"[Cleanup] Terminated existing AimiliVPN OpenVPN processes for {scope}.", flush=True)
     except Exception as e:
         print(f"[Cleanup Error] Failed to kill existing OpenVPN processes: {e}", flush=True)
 
@@ -2227,6 +2229,72 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
 
+  <section id="residential_pool_section" style="margin-bottom: 24px;">
+    <div class="stat" style="display: block; width: 100%; box-sizing: border-box;">
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 16px;">
+        <div style="display: flex; align-items: center; gap: 16px;">
+          <div class="stat-icon-wrapper" style="background: rgba(34, 211, 238, 0.1); border-color: rgba(34, 211, 238, 0.22);">
+            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" style="color:#22d3ee;"><path stroke-linecap="round" stroke-linejoin="round" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2h1a2 2 0 002-2v-1a2 2 0 012-2h1.945M7.707 4.293l1.414 1.414A1 1 0 009.828 6H14.17a1 1 0 00.707-.293l1.414-1.414M12 21a9 9 0 100-18 9 9 0 000 18z" /></svg>
+          </div>
+          <div>
+            <h3 style="margin: 0 0 4px 0; font-size: 16px; font-weight: 600; color: var(--text-primary);">住宅 IP 热池</h3>
+            <div id="res_status_message" style="font-size: 13px; color: var(--text-secondary);">加载中...</div>
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button id="btn_residential_repair" class="btn-primary" style="height: 38px; padding: 0 14px; background: rgba(34, 211, 238, 0.18); border: 1px solid rgba(34, 211, 238, 0.35);">
+            诊断补齐住宅IP
+          </button>
+          <button id="btn_residential_status" class="connect-btn" style="height: 38px; padding: 0 14px;">
+            刷新状态
+          </button>
+          <button id="btn_copy_subscription" class="connect-btn" style="height: 38px; padding: 0 14px;">
+            复制订阅地址
+          </button>
+        </div>
+      </div>
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 16px;">
+        <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 8px;">
+          <div style="font-size: 12px; color: var(--text-secondary);">住宅候选</div>
+          <strong id="res_candidate_count" style="font-size: 22px; color: var(--text-primary);">0</strong>
+        </div>
+        <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 8px;">
+          <div style="font-size: 12px; color: var(--text-secondary);">已验证</div>
+          <strong id="res_verified_count" style="font-size: 22px; color: var(--success);">0</strong>
+        </div>
+        <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 8px;">
+          <div style="font-size: 12px; color: var(--text-secondary);">热池目标</div>
+          <strong id="res_target_count" style="font-size: 22px; color: var(--primary);">4</strong>
+        </div>
+        <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 8px;">
+          <div style="font-size: 12px; color: var(--text-secondary);">已建网卡</div>
+          <strong id="res_tunnel_count" style="font-size: 22px; color: var(--text-primary);">0</strong>
+        </div>
+        <div style="padding: 12px; border: 1px solid var(--border-color); border-radius: 8px;">
+          <div style="font-size: 12px; color: var(--text-secondary);">可订阅</div>
+          <strong id="res_subscription_count" style="font-size: 22px; color: var(--success);">0</strong>
+        </div>
+      </div>
+      <input id="res_subscription_url" class="input-field mono" readonly style="margin-bottom: 14px; font-size: 12px;" value="">
+      <div class="table-container" style="max-height: 360px; overflow: auto; border: 1px solid var(--border-color); border-radius: 8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>状态</th>
+              <th>IP</th>
+              <th>延迟</th>
+              <th>网卡</th>
+              <th>接口</th>
+              <th>路由</th>
+              <th>消息</th>
+            </tr>
+          </thead>
+          <tbody id="residential_pool_rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <section class="toolbar">
     <select id="country_filter">
       <option value="">所有国家</option>
@@ -2338,7 +2406,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </main>
 <script>
-let nodes=[], state={}, testingNodeIds = new Set();
+let nodes=[], state={}, residentialStatus={}, testingNodeIds = new Set();
 let currentPage = 1;
 const pageSize = 11;
 let currentPageNodes = [];
@@ -2486,6 +2554,59 @@ function stableSortNodes() {
   });
 }
 
+function poolBadge(ok, yesText, noText, warn) {
+  if (warn) return `<span class="badge unavailable">${esc(warn)}</span>`;
+  return ok ? `<span class="badge available">${esc(yesText)}</span>` : `<span class="badge not_checked">${esc(noText)}</span>`;
+}
+
+function renderResidentialPool() {
+  const section = $("residential_pool_section");
+  if (!section) return;
+  const status = residentialStatus || {};
+  const counts = status.counts || {};
+  const subscription = status.subscription || {};
+  $("res_candidate_count").textContent = counts.residential_candidates || 0;
+  $("res_verified_count").textContent = counts.verified || 0;
+  $("res_target_count").textContent = counts.target || 4;
+  $("res_tunnel_count").textContent = counts.managed_interfaces || 0;
+  $("res_subscription_count").textContent = counts.subscription || 0;
+  $("res_subscription_url").value = subscription.url || "";
+  $("btn_copy_subscription").disabled = !subscription.url;
+
+  const message = status.error || status.message || "idle";
+  const detached = counts.detached_rules || 0;
+  const readyText = subscription.ready ? "订阅就绪" : "等待可订阅住宅 IP";
+  $("res_status_message").innerHTML = `${esc(readyText)} · ${esc(message === "idle" ? "暂无后台任务" : message)}${detached ? ` · <span style="color:var(--danger);">残留路由 ${detached}</span>` : ""}`;
+
+  const rows = status.nodes || [];
+  if (!rows.length) {
+    $("residential_pool_rows").innerHTML = `<tr><td colspan="7" style="text-align:center; color:var(--text-secondary); padding:24px 0;">暂无可用住宅 IP 候选。</td></tr>`;
+    return;
+  }
+  $("residential_pool_rows").innerHTML = rows.slice(0, 50).map(n => {
+    const statusBadge = n.subscribable
+      ? `<span class="badge available">可订阅</span>`
+      : (n.clash_probe_status === "unavailable" ? `<span class="badge unavailable">不可用</span>` : `<span class="badge not_checked">候选</span>`);
+    const interfaceWarn = n.rule_detached ? "残留" : "";
+    const ifaceBadge = poolBadge(n.interface_exists, "存在", "未建", interfaceWarn);
+    const routeOk = n.rule_exists && n.route_exists && !n.rule_detached;
+    const routeBadge = poolBadge(routeOk, "正常", "未绑定", "");
+    const latencyClass = getLatencyClass(n.latency_ms);
+    const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
+    const country = n.country_short || translateCountry(n.country) || "-";
+    const message = n.clash_probe_message || n.probe_status || "-";
+    return `<tr>
+      <td>${statusBadge}</td>
+      <td><div class="mono">${esc(n.ip)}:${esc(n.remote_port || "")}</div><div style="font-size:11px;color:var(--text-secondary);">${esc(country)} · ${esc(translateIpType(n.ip_type))}</div></td>
+      <td>${latencyText}</td>
+      <td class="mono">${esc(n.interface || "-")}${n.table ? `<div style="font-size:11px;color:var(--text-secondary);">table ${esc(n.table)}</div>` : ""}</td>
+      <td>${ifaceBadge}</td>
+      <td>${routeBadge}</td>
+      <td style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${esc(message)}">${esc(message)}</td>
+    </tr>`;
+  }).join("");
+}
+
 function render(){
   const activeNodeId = state.active_openvpn_node_id;
   const activeNode = nodes.find(n => n.active || n.id === activeNodeId);
@@ -2617,7 +2738,7 @@ function render(){
           pLatVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;" title="${esc(state.proxy_error)}">${esc(state.proxy_error || "连接失败")}</span>`;
         }
       }
-    } else {
+  } else {
       pBadge.className = "badge not_checked";
       pBadge.textContent = "未检测";
       pIpVal.textContent = "-";
@@ -2628,6 +2749,8 @@ function render(){
       }
     }
   }
+
+  renderResidentialPool();
 
   // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
@@ -2866,10 +2989,18 @@ $("btn_batch_test").onclick = async () => {
 };
 
 async function load(){
-  const r=await fetch("./api/nodes"); 
+  const [r, residentialResp]=await Promise.all([
+    fetch("./api/nodes"),
+    fetch("./api/residential_status").catch(()=>null)
+  ]);
   const d=await r.json(); 
   nodes=d.nodes||[]; 
   state=d.state||{}; 
+  if (residentialResp && residentialResp.ok) {
+    residentialStatus = await residentialResp.json();
+  } else {
+    residentialStatus = { ok: false, error: "住宅 IP 状态接口不可用", counts: {}, nodes: [], subscription: {} };
+  }
   
   stableSortNodes();
   updateCountryFilter();
@@ -2898,6 +3029,44 @@ $("check").onclick=async()=>{
   $("check").textContent="检测中..."; 
   try{await fetch("./api/check",{method:"POST"}); await load();} 
   finally{$("check").disabled=false; $("check").textContent="立即检测补齐";}
+};
+async function copyResidentialSubscription(){
+  const url = (residentialStatus.subscription || {}).url || $("res_subscription_url").value;
+  if (!url) {
+    alert("订阅地址暂不可用");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    alert("已复制订阅地址");
+  } catch(e) {
+    window.prompt("订阅地址", url);
+  }
+}
+$("btn_residential_status").onclick=async()=>{
+  await load();
+};
+$("btn_copy_subscription").onclick=copyResidentialSubscription;
+$("btn_residential_repair").onclick=async()=>{
+  const btn = $("btn_residential_repair");
+  btn.disabled = true;
+  btn.textContent = "正在诊断补齐...";
+  try{
+    const resp = await fetch("./api/residential_repair",{method:"POST"});
+    const result = await resp.json();
+    if (!result.ok) {
+      alert("诊断补齐失败: " + (result.error || "未知错误"));
+    }
+    await load();
+    setTimeout(load, 3000);
+  } catch(e) {
+    alert("诊断补齐请求失败");
+  } finally {
+    setTimeout(()=>{
+      btn.disabled = false;
+      btn.textContent = "诊断补齐住宅IP";
+    }, 3000);
+  }
 };
 $("clash_refresh").onclick=async()=>{
   const btn = $("clash_refresh");
@@ -3310,6 +3479,23 @@ class Handler(BaseHTTPRequestHandler):
         body = clash_bridge_manager.render_subscription(request_host=request_host)
         self.send_bytes(body.encode("utf-8"), "text/yaml; charset=utf-8")
 
+    def serve_residential_status(self) -> None:
+        global clash_bridge_manager
+        if clash_bridge_manager is None:
+            self.send_json({"ok": False, "error": "Clash bridge is not ready"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        request_host = self.headers.get("Host", "")
+        snapshot = clash_bridge_manager.residential_status_snapshot(request_host=request_host)
+        subscription = snapshot.get("subscription", {})
+        if isinstance(subscription, dict):
+            token = str(subscription.pop("token", "") or "")
+            if request_host and token:
+                secret_path = self.get_secret_path()
+                subscription["url"] = f"http://{request_host}/{secret_path}/sub/clash.yaml?token={urllib.parse.quote(token)}"
+            else:
+                subscription["url"] = ""
+        self.send_json(snapshot)
+
     def log_message(self, format: str, *args: Any) -> None:
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
@@ -3376,6 +3562,8 @@ class Handler(BaseHTTPRequestHandler):
                     del stripped["config_text"]
                 stripped_nodes.append(stripped)
             self.send_json({"nodes": stripped_nodes, "state": get_state()})
+        elif effective_path == "/api/residential_status":
+            self.serve_residential_status()
         elif effective_path.startswith("/configs/"):
             filename = urllib.parse.unquote(effective_path.removeprefix("/configs/"))
             with lock:
@@ -3586,11 +3774,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/clash_refresh":
             try:
-                global clash_bridge_manager
                 if clash_bridge_manager is None:
                     self.send_json({"ok": False, "error": "Clash bridge is not ready"}, HTTPStatus.SERVICE_UNAVAILABLE)
                     return
                 self.send_json(clash_bridge_manager.trigger_refresh())
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/residential_repair":
+            try:
+                if clash_bridge_manager is None:
+                    self.send_json({"ok": False, "error": "Clash bridge is not ready"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+                self.send_json(clash_bridge_manager.trigger_repair())
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         else:
@@ -3614,7 +3809,7 @@ class Tee:
 def main() -> None:
     global clash_bridge_manager
     ensure_dirs()
-    kill_existing_openvpn_processes()
+    kill_existing_openvpn_processes(include_clash_bridge=True)
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
