@@ -220,6 +220,8 @@ def get_state() -> dict[str, Any]:
     state["username"] = ui_cfg.get("username", "admin")
     state["port"] = ui_cfg.get("port", 8787)
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
+    if clash_bridge_manager is not None:
+        state["clash_bridge"] = clash_bridge_manager.refresh_status_snapshot()
     
     return state
 
@@ -2107,6 +2109,10 @@ INDEX_HTML = r"""<!doctype html>
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       立即检测补齐
     </button>
+    <button id="clash_refresh" class="btn-primary" style="background: rgba(34, 211, 238, 0.18); border: 1px solid rgba(34, 211, 238, 0.35);">
+      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" /></svg>
+      刷新 Clash 节点
+    </button>
     <div class="dropdown">
       <button id="admin_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
@@ -2565,7 +2571,9 @@ function render(){
   
   const statusMessage = state.last_check_message || "";
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${activeNode.id})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
-  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
+  const clashBridge = state.clash_bridge || {};
+  const clashStatusText = clashBridge.running ? ` | Clash：${esc(clashBridge.message || '正在验证')}` : "";
+  $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 活动节点：${activeNodeInfo} | 状态：${statusMessage}${clashStatusText}`;
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -2889,6 +2897,26 @@ $("check").onclick=async()=>{
   $("check").textContent="检测中..."; 
   try{await fetch("./api/check",{method:"POST"}); await load();} 
   finally{$("check").disabled=false; $("check").textContent="立即检测补齐";}
+};
+$("clash_refresh").onclick=async()=>{
+  const btn = $("clash_refresh");
+  btn.disabled = true;
+  btn.textContent = "正在验证...";
+  try{
+    const resp = await fetch("./api/clash_refresh",{method:"POST"});
+    const result = await resp.json();
+    if (!result.ok) {
+      alert("刷新 Clash 节点失败: " + (result.error || "未知错误"));
+    }
+    await load();
+  } catch(e) {
+    alert("刷新 Clash 节点请求失败");
+  } finally {
+    setTimeout(()=>{
+      btn.disabled = false;
+      btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" /></svg>刷新 Clash 节点`;
+    }, 3000);
+  }
 };
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
@@ -3553,6 +3581,15 @@ class Handler(BaseHTTPRequestHandler):
                         proxy_error=result.get("error", "未知错误")
                     )
                 self.send_json(result)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        elif effective_path == "/api/clash_refresh":
+            try:
+                global clash_bridge_manager
+                if clash_bridge_manager is None:
+                    self.send_json({"ok": False, "error": "Clash bridge is not ready"}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
+                self.send_json(clash_bridge_manager.trigger_refresh())
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         else:

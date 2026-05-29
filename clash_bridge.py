@@ -31,9 +31,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_tunnels": 8,
     "hot_per_group": 4,
     "idle_timeout_seconds": 900,
-    "prewarm_interval_seconds": 180,
-    "openvpn_timeout_seconds": 35,
-    "health_url": "http://www.gstatic.com/generate_204",
+        "prewarm_interval_seconds": 180,
+        "openvpn_timeout_seconds": 35,
+        "health_url": "http://www.gstatic.com/generate_204",
+        "refresh_verify_limit": 20,
 }
 
 
@@ -244,6 +245,9 @@ class ClashBridge:
         self.lock = threading.RLock()
         self.tunnels: dict[str, TunnelState] = {}
         self.running = False
+        self.refresh_lock = threading.Lock()
+        self.refresh_running = False
+        self.refresh_status = "idle"
 
     def load_config(self) -> dict[str, Any]:
         config = DEFAULT_CONFIG.copy()
@@ -362,6 +366,16 @@ class ClashBridge:
                         ]
                     )
 
+        main_group_choices: list[str] = []
+        if res_names:
+            main_group_choices.extend(["住宅IP-优选", "住宅IP-手动"])
+        if non_res_names:
+            main_group_choices.extend(["非住宅IP-优选", "非住宅IP-手动"])
+        if not main_group_choices:
+            main_group_choices = ["REJECT"]
+        elif "REJECT" not in main_group_choices:
+            main_group_choices.append("REJECT")
+
         lines.extend(
             [
                 "proxy-groups:",
@@ -370,7 +384,7 @@ class ClashBridge:
                 "    proxies:",
             ]
         )
-        for item in ["住宅IP-优选", "非住宅IP-优选", "住宅IP-手动", "非住宅IP-手动", "DIRECT"]:
+        for item in main_group_choices:
             lines.append(f"      - {_yaml_scalar(item)}")
 
         self._append_group(lines, "住宅IP-优选", "url-test", res_hot, health_url)
@@ -379,7 +393,57 @@ class ClashBridge:
         self._append_group(lines, "非住宅IP-手动", "select", non_res_names, health_url)
 
         lines.extend(["rules:", "  - MATCH,VPNGate出口"])
+        if all_nodes:
+            threading.Thread(target=self._prewarm_hot_nodes, daemon=True).start()
         return "\n".join(lines) + "\n"
+
+    def refresh_status_snapshot(self) -> dict[str, Any]:
+        with self.refresh_lock:
+            return {
+                "running": self.refresh_running,
+                "message": self.refresh_status,
+            }
+
+    def trigger_refresh(self) -> dict[str, Any]:
+        with self.refresh_lock:
+            if self.refresh_running:
+                return {"ok": True, "started": False, "message": self.refresh_status}
+            self.refresh_running = True
+            self.refresh_status = "正在后台验证 Clash 订阅节点..."
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
+        return {"ok": True, "started": True, "message": self.refresh_status}
+
+    def _refresh_worker(self) -> None:
+        checked = 0
+        failed = 0
+        try:
+            cfg = self.load_config()
+            limit = max(1, _parse_int(cfg.get("refresh_verify_limit"), 20))
+            nodes = self.available_nodes()[:limit]
+            if not nodes:
+                with self.refresh_lock:
+                    self.refresh_status = "没有可验证的 Clash 可用节点"
+                return
+            for node in nodes:
+                node_id = str(node.get("id") or "")
+                if not node_id:
+                    continue
+                checked += 1
+                with self.refresh_lock:
+                    self.refresh_status = f"正在验证 Clash 节点 {checked}/{len(nodes)}: {node_id}"
+                try:
+                    self.ensure_tunnel(node_id)
+                except Exception as exc:
+                    failed += 1
+                    print(f"[ClashBridge] refresh verification failed for {node_id}: {exc}", flush=True)
+            with self.refresh_lock:
+                self.refresh_status = f"Clash 节点验证完成：已检查 {checked} 个，剔除/失败 {failed} 个"
+        except Exception as exc:
+            with self.refresh_lock:
+                self.refresh_status = f"Clash 节点验证异常: {exc}"
+        finally:
+            with self.refresh_lock:
+                self.refresh_running = False
 
     def _proxy_names_for_nodes(self, nodes: list[dict[str, Any]]) -> list[str]:
         names: list[str] = []
@@ -409,7 +473,7 @@ class ClashBridge:
             for proxy_name in proxies:
                 lines.append(f"      - {_yaml_scalar(proxy_name)}")
         else:
-            lines.append(f"      - {_yaml_scalar('DIRECT')}")
+            lines.append(f"      - {_yaml_scalar('REJECT')}")
 
     def start(self) -> None:
         if not self.enabled():
@@ -448,6 +512,12 @@ class ClashBridge:
             table = 110 + _parse_int(interface.removeprefix("tun"), 10)
             process = self._start_openvpn(node, interface)
             self._setup_policy_routing(interface, table)
+            ok, message = self._check_tunnel_health(interface)
+            if not ok:
+                self._cleanup_policy_routing(interface, table)
+                self._stop_process(process)
+                self._mark_unavailable(node_id, message)
+                raise RuntimeError(message)
             self.tunnels[node_id] = TunnelState(
                 node_id=node_id,
                 interface=interface,
@@ -509,6 +579,36 @@ class ClashBridge:
             self._mark_unavailable(node_id, message)
             raise RuntimeError(message)
         return process
+
+    def _check_tunnel_health(self, interface: str) -> tuple[bool, str]:
+        cfg = self.load_config()
+        health_url = str(cfg.get("health_url") or DEFAULT_CONFIG["health_url"])
+        parsed = urllib.parse.urlsplit(health_url)
+        if parsed.scheme not in ("http", "") or not parsed.hostname:
+            return True, "health check skipped"
+        port = parsed.port or 80
+        path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        host_header = parsed.hostname
+        if parsed.port:
+            host_header = f"{host_header}:{parsed.port}"
+        try:
+            sock = create_bound_connection(interface, (parsed.hostname, port), timeout=8)
+            try:
+                request = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host_header}\r\n"
+                    "User-Agent: AimiliVPN-ClashBridge/1.0\r\n"
+                    "Connection: close\r\n\r\n"
+                )
+                sock.sendall(request.encode("ascii", errors="ignore"))
+                response = sock.recv(256)
+                if response.startswith(b"HTTP/1."):
+                    return True, "health check ok"
+                return False, "tunnel health check returned invalid response"
+            finally:
+                sock.close()
+        except Exception as exc:
+            return False, f"tunnel health check failed on {interface}: {exc}"
 
     def _wait_openvpn_ready(self, process: subprocess.Popen[str], node_id: str, interface: str) -> tuple[bool, str]:
         cfg = self.load_config()
@@ -686,6 +786,7 @@ class ClashBridge:
             password = recv_exact(client, recv_exact(client, 1)[0]).decode("utf-8", errors="replace")
             node = self._authenticate(username, password)
             if not node:
+                print(f"[ClashBridge] SOCKS auth failed from {address}: {username}", flush=True)
                 client.sendall(b"\x01\x01")
                 return
             client.sendall(b"\x01\x00")
@@ -746,6 +847,7 @@ class ClashBridge:
             method, target, version = lines[0].split(" ", 2)
             node = self._authenticate_http(lines)
             if not node:
+                print(f"[ClashBridge] HTTP auth failed from {address}", flush=True)
                 client.sendall(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"AimiliVPN\"\r\nContent-Length: 0\r\n\r\n")
                 return
             node_id = str(node.get("id") or "")
