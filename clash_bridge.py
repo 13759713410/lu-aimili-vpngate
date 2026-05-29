@@ -35,6 +35,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "openvpn_timeout_seconds": 35,
         "health_url": "http://www.gstatic.com/generate_204",
         "refresh_verify_limit": 20,
+        "subscription_requires_bridge_verified": True,
+        "verified_ttl_seconds": 1800,
 }
 
 
@@ -289,6 +291,19 @@ class ClashBridge:
         return "127.0.0.1"
 
     def available_nodes(self) -> list[dict[str, Any]]:
+        nodes = self._raw_available_nodes()
+        cfg = self.load_config()
+        if not bool(cfg.get("subscription_requires_bridge_verified", True)):
+            return nodes
+        ttl = max(60, _parse_int(cfg.get("verified_ttl_seconds"), 1800))
+        now = time.time()
+        return [
+            node for node in nodes
+            if node.get("clash_probe_status") == "available"
+            and now - float(node.get("clash_probed_at") or 0) <= ttl
+        ]
+
+    def _raw_available_nodes(self) -> list[dict[str, Any]]:
         nodes = _read_json(self.nodes_file, [])
         if not isinstance(nodes, list):
             return []
@@ -419,7 +434,7 @@ class ClashBridge:
         try:
             cfg = self.load_config()
             limit = max(1, _parse_int(cfg.get("refresh_verify_limit"), 20))
-            nodes = self.available_nodes()[:limit]
+            nodes = self._raw_available_nodes()[:limit]
             if not nodes:
                 with self.refresh_lock:
                     self.refresh_status = "没有可验证的 Clash 可用节点"
@@ -432,12 +447,17 @@ class ClashBridge:
                 with self.refresh_lock:
                     self.refresh_status = f"正在验证 Clash 节点 {checked}/{len(nodes)}: {node_id}"
                 try:
-                    self.ensure_tunnel(node_id)
+                    interface = self.ensure_tunnel(node_id)
+                    ok, message = self._check_tunnel_health(interface)
+                    if not ok:
+                        self._mark_unavailable(node_id, message)
+                        raise RuntimeError(message)
+                    self._mark_clash_available(node_id, "Clash bridge health check ok")
                 except Exception as exc:
                     failed += 1
                     print(f"[ClashBridge] refresh verification failed for {node_id}: {exc}", flush=True)
             with self.refresh_lock:
-                self.refresh_status = f"Clash 节点验证完成：已检查 {checked} 个，剔除/失败 {failed} 个"
+                self.refresh_status = f"Clash 节点验证完成：已检查 {checked} 个，通过 {checked - failed} 个，剔除/失败 {failed} 个；请在 Clash 客户端更新订阅"
         except Exception as exc:
             with self.refresh_lock:
                 self.refresh_status = f"Clash 节点验证异常: {exc}"
@@ -534,7 +554,7 @@ class ClashBridge:
         return create_bound_connection(interface, address)
 
     def _get_available_node(self, node_id: str) -> dict[str, Any] | None:
-        for node in self.available_nodes():
+        for node in self._raw_available_nodes():
             if str(node.get("id") or "") == node_id:
                 return node
         return None
@@ -713,7 +733,24 @@ class ClashBridge:
             if isinstance(node, dict) and str(node.get("id") or "") == node_id:
                 node["probe_status"] = "unavailable"
                 node["probe_message"] = f"Clash bridge failed: {message}"
+                node["clash_probe_status"] = "unavailable"
+                node["clash_probe_message"] = message
+                node["clash_probed_at"] = time.time()
                 node["probed_at"] = time.time()
+                changed = True
+        if changed:
+            _write_json(self.nodes_file, nodes)
+
+    def _mark_clash_available(self, node_id: str, message: str) -> None:
+        nodes = _read_json(self.nodes_file, [])
+        if not isinstance(nodes, list):
+            return
+        changed = False
+        for node in nodes:
+            if isinstance(node, dict) and str(node.get("id") or "") == node_id:
+                node["clash_probe_status"] = "available"
+                node["clash_probe_message"] = message
+                node["clash_probed_at"] = time.time()
                 changed = True
         if changed:
             _write_json(self.nodes_file, nodes)
