@@ -31,10 +31,10 @@ echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="baoweise-bot"
-DEFAULT_REPO="aimili-vpngate"
-DEFAULT_BRANCH="${AIMILIVPN_GITHUB_BRANCH:-}"
+# Default to the Clash bridge fork. Override with args/env if you want another repo.
+DEFAULT_USER="13759713410"
+DEFAULT_REPO="lu-aimili-vpngate"
+DEFAULT_BRANCH="${AIMILIVPN_GITHUB_BRANCH:-clash-bridge}"
 
 # Allow custom repository override via command line arguments
 GITHUB_USER="${1:-${AIMILIVPN_GITHUB_USER:-${DEFAULT_USER}}}"
